@@ -100,3 +100,9 @@ export default {
 
 Aponte o app para o domínio do Worker trocando `https://api.trello.com` por
 `https://seu-worker.workers.dev` em `src/App.jsx` (função `trelloUrl`).
+
+## Prints do projeto
+<img width="1638" height="898" alt="image" src="https://github.com/user-attachments/assets/79c0b31f-3192-4f94-aaed-d7da36aab145" />
+<img width="1654" height="576" alt="image" src="https://github.com/user-attachments/assets/23fd2cfa-1735-4a49-9007-e6340f7f2b88" />
+
+
