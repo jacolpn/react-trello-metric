@@ -35,6 +35,10 @@ import TableRow from "@mui/material/TableRow";
 import Link from "@mui/material/Link";
 import Tabs from "@mui/material/Tabs";
 import Tab from "@mui/material/Tab";
+import Dialog from "@mui/material/Dialog";
+import DialogTitle from "@mui/material/DialogTitle";
+import DialogContent from "@mui/material/DialogContent";
+import DialogActions from "@mui/material/DialogActions";
 
 import SettingsIcon from "@mui/icons-material/Settings";
 import RefreshIcon from "@mui/icons-material/Refresh";
@@ -48,6 +52,8 @@ import TrendingUpIcon from "@mui/icons-material/TrendingUp";
 import LocalOfferIcon from "@mui/icons-material/LocalOffer";
 import TableChartIcon from "@mui/icons-material/TableChart";
 import ViewKanbanIcon from "@mui/icons-material/ViewKanban";
+import AddIcon from "@mui/icons-material/Add";
+import CloseIcon from "@mui/icons-material/Close";
 
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
@@ -61,6 +67,7 @@ const CREDENTIALS_KEY = "trello-metrics-credentials";
 const BOARD_CONFIG_PREFIX = "trello-metrics-board:";
 const METRICS_CACHE_KEY = "trello-metrics-cache";
 const MODE_KEY = "trello-metrics-mode";
+const CUSTOM_BOARDS_KEY = "trello-metrics-custom-boards";
 
 const BOARDS = [
   { key: "ft", label: "FT", url: "https://trello.com/b/qfV4h6W4/cloud-ft" },
@@ -165,6 +172,21 @@ function saveBoardConfig(boardKey, cfg) {
   try { localStorage.setItem(BOARD_CONFIG_PREFIX + boardKey, JSON.stringify(cfg)); } catch (e) {}
 }
 
+function loadCustomBoards() {
+  try {
+    const raw = localStorage.getItem(CUSTOM_BOARDS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed.filter(b => b && b.key && b.url);
+    }
+  } catch (e) {}
+  return [];
+}
+
+function saveCustomBoards(boards) {
+  try { localStorage.setItem(CUSTOM_BOARDS_KEY, JSON.stringify(boards)); } catch (e) {}
+}
+
 function loadMetricsCache() {
   try {
     const raw = localStorage.getItem(METRICS_CACHE_KEY);
@@ -228,6 +250,13 @@ function DashboardApp() {
   const [activeReport, setActiveReport] = useState("resumo");
 
   const [activeBoardKey, setActiveBoardKey] = useState(BOARDS[0].key);
+  const [customBoards, setCustomBoards] = useState([]);
+  const [addBoardOpen, setAddBoardOpen] = useState(false);
+  const [addBoardUrl, setAddBoardUrl] = useState("");
+  const [addBoardLabel, setAddBoardLabel] = useState("");
+  const [addBoardError, setAddBoardError] = useState("");
+
+  const allBoards = useMemo(() => [...BOARDS, ...customBoards], [customBoards]);
 
   const [boardInput, setBoardInput] = useState("");
   const [lists, setLists] = useState([]);
@@ -257,6 +286,7 @@ function DashboardApp() {
       }
     } catch (e) {}
     setMetricsCache(loadMetricsCache());
+    setCustomBoards(loadCustomBoards());
     applyBoardConfig(BOARDS[0].key, BOARDS[0].url);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -294,17 +324,82 @@ function DashboardApp() {
   }
 
   function switchBoard(boardKey) {
+    if (boardKey === "__add__") return; // tab de ação, não é um quadro
     if (boardKey === activeBoardKey) return;
     persistCurrentBoardConfig(activeBoardKey);
     setError("");
     setCards(null);
     setActions(null);
-    const boardDef = BOARDS.find(b => b.key === boardKey);
+    const boardDef = allBoards.find(b => b.key === boardKey);
     applyBoardConfig(boardKey, boardDef ? boardDef.url : "");
     setActiveBoardKey(boardKey);
     setActiveReport("resumo");
     const hasLists = loadBoardConfig(boardKey).lists?.length > 0;
     setShowConfig(!hasLists);
+  }
+
+  function openAddBoard() {
+    setAddBoardUrl("");
+    setAddBoardLabel("");
+    setAddBoardError("");
+    setAddBoardOpen(true);
+  }
+
+  function confirmAddBoard() {
+    const boardId = extractBoardId(addBoardUrl);
+    if (!boardId) {
+      setAddBoardError("Informe uma URL de quadro do Trello válida.");
+      return;
+    }
+    // Reaproveita se o quadro já existe (fixo ou custom) — só troca pra ele.
+    const existing = allBoards.find(b => extractBoardId(b.url) === boardId);
+    if (existing) {
+      setAddBoardOpen(false);
+      switchBoard(existing.key);
+      return;
+    }
+    const key = `custom-${boardId}`;
+    const label = addBoardLabel.trim() || `Outro (${boardId.slice(0, 6)})`;
+    const url = addBoardUrl.trim();
+    const nextCustom = [...customBoards, { key, label, url }];
+    setCustomBoards(nextCustom);
+    saveCustomBoards(nextCustom);
+    setAddBoardOpen(false);
+
+    // Mesmo fluxo do switchBoard, mas o boardDef ainda não está em allBoards.
+    persistCurrentBoardConfig(activeBoardKey);
+    setError("");
+    setCards(null);
+    setActions(null);
+    applyBoardConfig(key, url);
+    setActiveBoardKey(key);
+    setActiveReport("resumo");
+    setShowConfig(true);
+  }
+
+  function removeCustomBoard(boardKey) {
+    const nextCustom = customBoards.filter(b => b.key !== boardKey);
+    setCustomBoards(nextCustom);
+    saveCustomBoards(nextCustom);
+    try { localStorage.removeItem(BOARD_CONFIG_PREFIX + boardKey); } catch (e) {}
+    setMetricsCache(prev => {
+      const next = { ...prev };
+      delete next[boardKey];
+      saveMetricsCache(next);
+      return next;
+    });
+    if (boardKey === activeBoardKey) {
+      // volta pro primeiro quadro fixo
+      persistCurrentBoardConfig(activeBoardKey);
+      setError("");
+      setCards(null);
+      setActions(null);
+      applyBoardConfig(BOARDS[0].key, BOARDS[0].url);
+      setActiveBoardKey(BOARDS[0].key);
+      setActiveReport("resumo");
+      const hasLists = loadBoardConfig(BOARDS[0].key).lists?.length > 0;
+      setShowConfig(!hasLists);
+    }
   }
 
   function reconcileCategoryIds(currentLabels, savedIds, seenIds) {
@@ -547,8 +642,9 @@ function DashboardApp() {
           scrollButtons="auto"
           sx={{ borderTop: "1px solid", borderColor: "divider", px: 1 }}
         >
-          {BOARDS.map(b => {
+          {allBoards.map(b => {
             const cached = metricsCache[b.key];
+            const isCustom = b.key.startsWith("custom-");
             return (
               <Tab
                 key={b.key}
@@ -556,19 +652,77 @@ function DashboardApp() {
                 icon={<ViewKanbanIcon fontSize="small" />}
                 iconPosition="start"
                 label={
-                  <Box sx={{ textAlign: "left", lineHeight: 1.2 }}>
-                    <Typography variant="body2" component="div">{b.label}</Typography>
-                    <Typography variant="caption" component="div" sx={{ color: (palettes[mode] || palettes.light).textLight }}>
-                      {cached ? `${cached.rangeDays}d · cycle ${fmt(cached.avgCycle)}d` : "não calculado"}
-                    </Typography>
+                  <Box sx={{ display: "flex", alignItems: "center", gap: 0.5 }}>
+                    <Box sx={{ textAlign: "left", lineHeight: 1.2 }}>
+                      <Typography variant="body2" component="div">{b.label}</Typography>
+                      <Typography variant="caption" component="div" sx={{ color: (palettes[mode] || palettes.light).textLight }}>
+                        {cached ? `${cached.rangeDays}d · cycle ${fmt(cached.avgCycle)}d` : "não calculado"}
+                      </Typography>
+                    </Box>
+                    {isCustom && (
+                      <IconButton
+                        component="span"
+                        size="small"
+                        aria-label={`Remover ${b.label}`}
+                        onClick={(e) => { e.stopPropagation(); removeCustomBoard(b.key); }}
+                        sx={{ p: 0.25 }}
+                      >
+                        <CloseIcon sx={{ fontSize: 14 }} />
+                      </IconButton>
+                    )}
                   </Box>
                 }
                 sx={{ minHeight: 56, alignItems: "flex-start", pt: 1 }}
               />
             );
           })}
+          <Tab
+            key="__add__"
+            value="__add__"
+            onClick={(e) => { e.preventDefault(); openAddBoard(); }}
+            icon={<AddIcon fontSize="small" />}
+            iconPosition="start"
+            label="Outro"
+            sx={{ minHeight: 56, alignItems: "flex-start", pt: 1 }}
+          />
         </Tabs>
       </AppBar>
+
+      <Dialog open={addBoardOpen} onClose={() => setAddBoardOpen(false)} maxWidth="sm" fullWidth>
+        <DialogTitle>Adicionar outro quadro</DialogTitle>
+        <DialogContent>
+          <Typography variant="body2" sx={{ mb: 2 }}>
+            Cole a URL do quadro do Trello que deseja acompanhar. Ele fica salvo
+            só neste navegador.
+          </Typography>
+          <TextField
+            label="URL do quadro"
+            fullWidth
+            size="small"
+            autoFocus
+            value={addBoardUrl}
+            onChange={e => { setAddBoardUrl(e.target.value); setAddBoardError(""); }}
+            onKeyDown={e => { if (e.key === "Enter") confirmAddBoard(); }}
+            placeholder="https://trello.com/b/xxxxxxxx/nome-do-quadro"
+            error={!!addBoardError}
+            helperText={addBoardError || " "}
+            sx={{ mb: 1 }}
+          />
+          <TextField
+            label="Nome (opcional)"
+            fullWidth
+            size="small"
+            value={addBoardLabel}
+            onChange={e => setAddBoardLabel(e.target.value)}
+            onKeyDown={e => { if (e.key === "Enter") confirmAddBoard(); }}
+            placeholder="Como aparecerá na aba"
+          />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setAddBoardOpen(false)}>Cancelar</Button>
+          <Button variant="contained" onClick={confirmAddBoard}>Adicionar</Button>
+        </DialogActions>
+      </Dialog>
 
       <Container maxWidth="lg" sx={{ py: 4 }}>
         <Collapse in={showConfig}>
