@@ -27,6 +27,7 @@ fornece.
 |---|---|---|
 | **Lead time** | Tempo entre a criação do card e ele chegar numa lista de "concluído" | `dataConclusão - dataCriação` |
 | **Cycle time** | Tempo entre o card entrar numa lista de "em andamento" e chegar numa lista de "concluído" | `dataConclusão - dataEntradaEmAndamento` |
+| **Cycle time (mediana)** | Cycle time do card "típico" do período — valor central resistente a outliers | Mediana dos `cycleDays` de todos os cards concluídos |
 | **Velocity** | Quantidade de cards concluídos por semana (semana ISO) | Contagem de cards com `doneAt` na mesma semana ISO |
 | **Categoria** | A etiqueta do card, restrita às etiquetas marcadas como "categoria" na config | Primeira etiqueta do card que esteja no conjunto `categoryLabelIds` |
 
@@ -80,6 +81,43 @@ cache local (por quadro), e trocar de aba mostra instantaneamente o último
 resultado calculado daquele quadro — com um aviso indicando quando foi
 calculado — em vez de forçar um recálculo. O usuário decide quando quer
 atualizar (botão "Calcular métricas").
+
+### Control chart de cycle time: mediana + banda de variação (estilo Jira)
+
+Pedido do gestor: *"Seria legal termos a mediana também, pra tirar os cards
+que ficam muito fora da média."* A distribuição de cycle time é tipicamente
+assimétrica — uns poucos cards que ficam semanas travados **puxam a média
+pra cima** e fazem ela deixar de representar o card típico. A mediana não
+sofre essa distorção, então é a referência central mais honesta.
+
+A implementação segue o **Control Chart do Jira** e tem uma decisão de
+negócio importante: **nenhum card é removido do cálculo**. "Tirar os cards
+muito fora" é resolvido *visualmente* (destacando quem está fora), não
+excluindo dado. O control chart de cycle time mostra:
+
+- **Linha da mediana** (cheia, cor primária): a referência central, o card
+  "típico". É ela que neutraliza a distorção dos outliers sem excluí-los.
+- **Linha da média** (tracejada, discreta): mantida só para comparação —
+  quanto mais longe da mediana, mais a média está inflada por outliers.
+- **Banda de variação normal** (área sombreada): ±1 desvio padrão em torno
+  da média. Pontos **fora da banda** são exatamente "os cards que ficaram
+  muito fora do padrão".
+
+Na **Visão geral** há dois tiles lado a lado — "Cycle time médio" e
+"Cycle time (mediana)" — justamente para dar um bate-olho de quão distante
+a média está do típico.
+
+Cálculo em `App.jsx` (helpers `median()` e `stdev()` dentro do `useMemo`
+de métricas): expõe `medianCycle`, `cycleBandLow` e `cycleBandHigh`
+(`= média ∓ desvio`, com piso em 0). A banda usa desvio padrão em torno da
+**média** (não da mediana) porque é assim que o Jira desenha e é o que a
+maioria das pessoas espera de "faixa normal".
+
+**Decisão em aberto (alinhar com o gestor):** hoje os outliers são
+*destacados*, não *filtrados*. Se em algum momento o pedido virar excluir
+outliers do próprio cálculo (ex.: cortar acima do percentil 85 antes de
+tirar média/velocity), isso é uma mudança de escopo separada e ainda **não**
+foi feita.
 
 ### Quadros mapeados
 
@@ -255,6 +293,10 @@ para não reintroduzir o mesmo problema depois.
   pedir API key/token manual.
 - Cumulative Flow Diagram (outro relatório clássico de fluxo, parecido com
   o Control Chart que já existe para cycle time).
+- Opção de **filtrar** outliers do cálculo (não só destacá-los) — ex.: cortar
+  acima de um percentil configurável antes de calcular média/velocity. Hoje
+  os outliers só são destacados visualmente (ver "Control chart de cycle
+  time" nas regras de negócio). Depende de alinhamento com o gestor.
 - ~~Adicionar de volta uma forma de conectar em quadros fora da lista fixa de
   6~~ — **feito**: aba "+ Outro" (ver "Quadros mapeados"). Quadros custom
   ficam só no `localStorage` do navegador, não são compartilhados entre

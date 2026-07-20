@@ -57,7 +57,7 @@ import CloseIcon from "@mui/icons-material/Close";
 
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell,
-  ScatterChart, Scatter, ReferenceLine,
+  ScatterChart, Scatter, ReferenceLine, ReferenceArea,
 } from "recharts";
 
 import { GlobalStyles } from "./styles/GlobalStyles.jsx";
@@ -86,8 +86,8 @@ const TRELLO_COLORS = {
 
 function chartPalette(mode) {
   return mode === "light"
-    ? { primary: "#47b4ec", grid: "#e5e5e5", axis: "#6d7072", tooltipBg: "#ffffff", tooltipBorder: "#e5e5e5" }
-    : { primary: "#3aa8e6", grid: "#333333", axis: "#b0b0b0", tooltipBg: "#212121", tooltipBorder: "#333333" };
+    ? { primary: "#47b4ec", grid: "#e5e5e5", axis: "#6d7072", tooltipBg: "#ffffff", tooltipBorder: "#e5e5e5", tooltipText: "#1a1a1a" }
+    : { primary: "#3aa8e6", grid: "#333333", axis: "#b0b0b0", tooltipBg: "#212121", tooltipBorder: "#333333", tooltipText: "#e5e5e5" };
 }
 
 const NAV_ITEMS = [
@@ -528,9 +528,25 @@ function DashboardApp() {
     }
 
     const avg = (arr) => arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : null;
+    const median = (arr) => {
+      if (!arr.length) return null;
+      const s = [...arr].sort((a, b) => a - b);
+      const mid = Math.floor(s.length / 2);
+      return s.length % 2 ? s[mid] : (s[mid - 1] + s[mid]) / 2;
+    };
+    const stdev = (arr, mean) => {
+      if (arr.length < 2) return null;
+      const variance = arr.reduce((s, v) => s + (v - mean) ** 2, 0) / arr.length;
+      return Math.sqrt(variance);
+    };
     const leadValues = completed.map(c => c.leadDays);
     const cycleValues = completed.filter(c => c.cycleDays != null).map(c => c.cycleDays);
     const avgCycle = cycleValues.length ? avg(cycleValues) : null;
+    const medianCycle = median(cycleValues);
+    // banda "normal" à la Jira: ±1 desvio padrão em torno da média, sem excluir cards do cálculo
+    const cycleStd = avgCycle != null ? stdev(cycleValues, avgCycle) : null;
+    const cycleBandLow = cycleStd != null ? Math.max(0, avgCycle - cycleStd) : null;
+    const cycleBandHigh = cycleStd != null ? avgCycle + cycleStd : null;
 
     const cycleScatter = completed
       .filter(c => c.cycleDays != null)
@@ -566,6 +582,9 @@ function DashboardApp() {
       completedCount: completed.length,
       avgLead: avg(leadValues),
       avgCycle,
+      medianCycle,
+      cycleBandLow,
+      cycleBandHigh,
       avgVelocity,
       velocity,
       categories,
@@ -923,6 +942,7 @@ function DashboardApp() {
                     <Grid container spacing={2}>
                       <Grid item xs={6} sm={3}><StatTile label="Lead time médio" value={fmt(metrics.avgLead)} unit="dias" /></Grid>
                       <Grid item xs={6} sm={3}><StatTile label="Cycle time médio" value={fmt(metrics.avgCycle)} unit="dias" /></Grid>
+                      <Grid item xs={6} sm={3}><StatTile label="Cycle time (mediana)" value={fmt(metrics.medianCycle)} unit="dias" /></Grid>
                       <Grid item xs={6} sm={3}><StatTile label="Velocity média" value={fmt(metrics.avgVelocity)} unit="cards/semana" /></Grid>
                       <Grid item xs={6} sm={3}><StatTile label="Cards concluídos" value={metrics.completedCount} unit={`nos últimos ${rangeDays}d`} /></Grid>
                     </Grid>
@@ -934,11 +954,25 @@ function DashboardApp() {
                     <ReportHeader
                     mode={mode}
                       title="Control chart — cycle time"
-                      description="Cada ponto é um card concluído, posicionado pela data de conclusão e pelo tempo que passou entre entrar em 'em andamento' e ser finalizado. A linha tracejada é a média do período — pontos muito acima dela indicam cards que passaram mais tempo em execução do que o normal."
+                      description="Cada ponto é um card concluído, posicionado pela data de conclusão e pelo tempo entre entrar em 'em andamento' e ser finalizado. A linha cheia é a mediana do período (o card 'típico', que não é distorcida por poucos cards muito lentos); a linha tracejada é a média. A faixa sombreada é a variação normal (±1 desvio) — pontos fora dela são os cards que ficaram muito fora do padrão."
                     />
+                    <Box sx={{ display: "flex", flexWrap: "wrap", gap: 2, mb: 1, fontSize: 12, color: palette.axis }}>
+                      <Box sx={{ display: "flex", alignItems: "center", gap: 0.75 }}>
+                        <Box component="span" sx={{ width: 16, height: 0, borderTop: `2px solid ${palette.primary}` }} />
+                        mediana <b style={{ color: palette.primary }}>{fmt(metrics.medianCycle)}d</b>
+                      </Box>
+                      <Box sx={{ display: "flex", alignItems: "center", gap: 0.75 }}>
+                        <Box component="span" sx={{ width: 16, height: 0, borderTop: `2px dashed ${palette.axis}` }} />
+                        média <b>{fmt(metrics.avgCycle)}d</b>
+                      </Box>
+                      <Box sx={{ display: "flex", alignItems: "center", gap: 0.75 }}>
+                        <Box component="span" sx={{ width: 16, height: 12, background: palette.primary, opacity: 0.12, borderRadius: "2px" }} />
+                        variação normal (±1 desvio)
+                      </Box>
+                    </Box>
                     <Box sx={{ width: "100%", height: 320 }}>
                       <ResponsiveContainer>
-                        <ScatterChart margin={{ top: 8, right: 16, left: 0, bottom: 0 }}>
+                        <ScatterChart margin={{ top: 8, right: 24, left: 0, bottom: 0 }}>
                           <CartesianGrid stroke={palette.grid} />
                           <XAxis
                             dataKey="x" type="number" domain={["dataMin", "dataMax"]}
@@ -951,13 +985,27 @@ function DashboardApp() {
                             label={{ value: "dias", angle: -90, position: "insideLeft", fill: palette.axis, fontSize: 11 }}
                           />
                           <Tooltip
-                            contentStyle={{ background: palette.tooltipBg, border: `1px solid ${palette.tooltipBorder}`, borderRadius: 6, fontSize: 12 }}
-                            labelFormatter={() => ""}
-                            formatter={(value, _name, props) => [`${value} dias`, props.payload.name]}
+                            cursor={{ stroke: palette.grid }}
+                            content={({ active, payload }) => {
+                              if (!active || !payload || !payload.length) return null;
+                              const p = payload[0].payload;
+                              return (
+                                <Box sx={{ background: palette.tooltipBg, border: `1px solid ${palette.tooltipBorder}`, borderRadius: "6px", fontSize: 12, color: palette.tooltipText, p: 1 }}>
+                                  <div style={{ fontWeight: 600, marginBottom: 2 }}>{p.name}</div>
+                                  <div>{p.y} dias em execução</div>
+                                </Box>
+                              );
+                            }}
                           />
+                          {metrics.cycleBandLow != null && (
+                            <ReferenceArea y1={metrics.cycleBandLow} y2={metrics.cycleBandHigh}
+                              fill={palette.primary} fillOpacity={0.08} stroke="none" />
+                          )}
                           {metrics.avgCycle != null && (
-                            <ReferenceLine y={metrics.avgCycle} stroke={palette.primary} strokeDasharray="4 4"
-                              label={{ value: `média ${fmt(metrics.avgCycle)}d`, position: "right", fill: palette.primary, fontSize: 11 }} />
+                            <ReferenceLine y={metrics.avgCycle} stroke={palette.axis} strokeDasharray="4 4" />
+                          )}
+                          {metrics.medianCycle != null && (
+                            <ReferenceLine y={metrics.medianCycle} stroke={palette.primary} strokeWidth={2} />
                           )}
                           <Scatter data={metrics.cycleScatter} fill={palette.primary} />
                         </ScatterChart>
@@ -979,7 +1027,12 @@ function DashboardApp() {
                           <CartesianGrid stroke={palette.grid} vertical={false} />
                           <XAxis dataKey="week" tick={{ fill: palette.axis, fontSize: 11 }} axisLine={{ stroke: palette.grid }} tickLine={false} />
                           <YAxis tick={{ fill: palette.axis, fontSize: 11 }} axisLine={false} tickLine={false} allowDecimals={false} />
-                          <Tooltip contentStyle={{ background: palette.tooltipBg, border: `1px solid ${palette.tooltipBorder}`, borderRadius: 6, fontSize: 12 }} />
+                          <Tooltip
+                            contentStyle={{ background: palette.tooltipBg, border: `1px solid ${palette.tooltipBorder}`, borderRadius: 6, fontSize: 12, color: palette.tooltipText }}
+                            labelStyle={{ color: palette.tooltipText }}
+                            itemStyle={{ color: palette.tooltipText }}
+                            cursor={{ fill: palette.grid, fillOpacity: 0.2 }}
+                          />
                           <Bar dataKey="count" name="Cards concluídos" fill={palette.primary} radius={[3, 3, 0, 0]} maxBarSize={36} />
                         </BarChart>
                       </ResponsiveContainer>
@@ -1000,7 +1053,12 @@ function DashboardApp() {
                           <CartesianGrid stroke={palette.grid} horizontal={false} />
                           <XAxis type="number" tick={{ fill: palette.axis, fontSize: 11 }} axisLine={{ stroke: palette.grid }} tickLine={false} allowDecimals={false} />
                           <YAxis dataKey="name" type="category" width={140} tick={{ fill: palette.axis, fontSize: 12 }} axisLine={false} tickLine={false} />
-                          <Tooltip contentStyle={{ background: palette.tooltipBg, border: `1px solid ${palette.tooltipBorder}`, borderRadius: 6, fontSize: 12 }} />
+                          <Tooltip
+                            contentStyle={{ background: palette.tooltipBg, border: `1px solid ${palette.tooltipBorder}`, borderRadius: 6, fontSize: 12, color: palette.tooltipText }}
+                            labelStyle={{ color: palette.tooltipText }}
+                            itemStyle={{ color: palette.tooltipText }}
+                            cursor={{ fill: palette.grid, fillOpacity: 0.2 }}
+                          />
                           <Bar dataKey="count" name="Cards" radius={[0, 3, 3, 0]} maxBarSize={20}>
                             {metrics.categories.map((c, i) => <Cell key={i} fill={c.color} />)}
                           </Bar>
