@@ -448,7 +448,7 @@ function DashboardApp() {
       setLoadingMsg("Buscando cards e etiquetas do quadro...");
       const [cardsRes, labelsRes] = await Promise.all([
         fetch(trelloUrl(`/boards/${boardId}/cards`, apiKey, token, {
-          fields: "id,name,idList,idBoard,closed,dateLastActivity,idLabels",
+          fields: "id,name,idList,idBoard,closed,dateLastActivity,idLabels,shortLink,url",
         })),
         fetch(trelloUrl(`/boards/${boardId}/labels`, apiKey, token, { fields: "name,color", limit: "1000" })),
       ]);
@@ -521,6 +521,7 @@ function DashboardApp() {
         const relevantIds = (card.idLabels || []).filter(id => categoryLabelIds.has(id));
         completed.push({
           id: card.id, name: card.name,
+          url: card.url || (card.shortLink ? `https://trello.com/c/${card.shortLink}` : `https://trello.com/c/${card.id}`),
           category: labelById[relevantIds[0]]?.name || "Sem categoria",
           createdAt, doneAt: cycleEnd, leadDays, cycleDays,
         });
@@ -550,7 +551,7 @@ function DashboardApp() {
 
     const cycleScatter = completed
       .filter(c => c.cycleDays != null)
-      .map(c => ({ x: c.doneAt.getTime(), y: Number(c.cycleDays.toFixed(1)), name: c.name }))
+      .map(c => ({ x: c.doneAt.getTime(), y: Number(c.cycleDays.toFixed(1)), name: c.name, url: c.url }))
       .sort((a, b) => a.x - b.x);
 
     const weekMap = {};
@@ -1007,7 +1008,12 @@ function DashboardApp() {
                           {metrics.medianCycle != null && (
                             <ReferenceLine y={metrics.medianCycle} stroke={palette.primary} strokeWidth={2} />
                           )}
-                          <Scatter data={metrics.cycleScatter} fill={palette.primary} />
+                          <Scatter
+                            data={metrics.cycleScatter}
+                            fill={palette.primary}
+                            cursor="pointer"
+                            onClick={(p) => { if (p?.url) window.open(p.url, "_blank", "noopener,noreferrer"); }}
+                          />
                         </ScatterChart>
                       </ResponsiveContainer>
                     </Box>
