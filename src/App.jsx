@@ -136,6 +136,62 @@ async function fetchAllActions(boardId, key, token, sinceDate, onProgress) {
   return all;
 }
 
+// Cards "espelhados" (mirror cards) do Trello são só uma referência: seus
+// próprios idLabels/idMembers/customFieldItems vêm VAZIOS na API — os dados
+// reais moram no card de origem (mirrorSourceId), normalmente no board de
+// backlog. Aqui buscamos cada card de origem uma vez (por ID, GET /1/cards/{id})
+// para depois hidratar os espelhados. Falha em um card de origem não derruba a
+// análise: o espelhado só fica sem os dados daquela origem.
+async function fetchMirrorSources(mirrorCards, key, token) {
+  const sourceIds = [...new Set(
+    mirrorCards.map(c => c.mirrorSourceId).filter(Boolean)
+  )];
+  const byId = {};
+  await Promise.all(sourceIds.map(async (id) => {
+    try {
+      const res = await fetch(trelloUrl(`/cards/${id}`, key, token, {
+        fields: "idLabels,idMembers,idBoard",
+        members: "true",
+        member_fields: "fullName,username",
+        customFieldItems: "true",
+      }));
+      if (res.ok) byId[id] = await res.json();
+    } catch (e) { /* origem inacessível: espelhado degrada sem dados */ }
+  }));
+
+  // O endpoint de card único NÃO devolve as definições de etiqueta nem de
+  // custom field de forma confiável (o param `labels=true` volta vazio — mesma
+  // armadilha do item 1 dos débitos técnicos). Então buscamos etiquetas E
+  // definições de custom field POR BOARD de origem (normalmente só o
+  // Cloud Backlog) e resolvemos os idLabels/idCustomField por id.
+  const boardIds = [...new Set(Object.values(byId).map(c => c.idBoard).filter(Boolean))];
+  const labelsByBoard = {};
+  const fieldsByBoard = {};
+  await Promise.all(boardIds.flatMap((bid) => [
+    (async () => {
+      try {
+        const res = await fetch(trelloUrl(`/boards/${bid}/labels`, key, token, { fields: "name,color", limit: "1000" }));
+        if (res.ok) labelsByBoard[bid] = await res.json();
+      } catch (e) { /* sem etiquetas acessíveis: espelhado fica "Sem categoria" */ }
+    })(),
+    (async () => {
+      try {
+        const res = await fetch(trelloUrl(`/boards/${bid}/customFields`, key, token));
+        if (res.ok) fieldsByBoard[bid] = await res.json();
+      } catch (e) { /* sem custom fields na origem: complexidade fica em branco */ }
+    })(),
+  ]));
+  for (const card of Object.values(byId)) {
+    const labels = labelsByBoard[card.idBoard] || [];
+    const byLabelId = {};
+    for (const l of labels) byLabelId[l.id] = l;
+    // resolve idLabels da origem → objetos {id,name,color}, para mesclar no lookup
+    card.labels = (card.idLabels || []).map(id => byLabelId[id]).filter(Boolean);
+    card.customFields = fieldsByBoard[card.idBoard] || [];
+  }
+  return byId;
+}
+
 function isoWeekKey(date) {
   const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
   const day = d.getUTCDay() || 7;
@@ -452,7 +508,7 @@ function DashboardApp() {
       setLoadingMsg("Buscando cards e etiquetas do quadro...");
       const [cardsRes, labelsRes, membersRes, customFieldsRes] = await Promise.all([
         fetch(trelloUrl(`/boards/${boardId}/cards`, apiKey, token, {
-          fields: "id,name,idList,idBoard,closed,dateLastActivity,idLabels,idMembers,shortLink,url",
+          fields: "id,name,idList,idBoard,closed,dateLastActivity,idLabels,idMembers,shortLink,url,cardRole,mirrorSourceId",
           customFieldItems: "true",
         })),
         fetch(trelloUrl(`/boards/${boardId}/labels`, apiKey, token, { fields: "name,color", limit: "1000" })),
@@ -468,6 +524,51 @@ function DashboardApp() {
       // simplesmente não aparece — o resto do dashboard continua funcionando.
       const membersData = membersRes.ok ? await membersRes.json() : [];
       const customFieldsData = customFieldsRes.ok ? await customFieldsRes.json() : [];
+
+      // Hidratar cards espelhados: eles nascem sem etiqueta/membro/complexidade
+      // próprios (os dados moram no card de origem). Buscamos cada origem e
+      // copiamos idLabels/idMembers/customFieldItems para o espelhado, além de
+      // mesclar labels/membros/custom fields da origem nos mapas de lookup, para
+      // que o pipeline de métricas resolva os nomes normalmente.
+      const mirrors = cardsData.filter(c => c.cardRole === "mirror" && c.mirrorSourceId);
+      if (mirrors.length) {
+        setLoadingMsg(`Buscando dados de ${mirrors.length} card(s) espelhado(s)...`);
+        const sources = await fetchMirrorSources(mirrors, apiKey, token);
+
+        // De-dup por id ao mesclar coleções da origem (labels/membros são
+        // globais no Trello, então o mesmo id nunca conflita com o do produto).
+        const mergeById = (base, extra) => {
+          const seen = new Set(base.map(x => x.id));
+          for (const x of extra) if (x && x.id && !seen.has(x.id)) { seen.add(x.id); base.push(x); }
+        };
+        // Custom field "Complexidade" do produto (se existir), para redirecionar
+        // os itens da origem ao mesmo id que o pipeline vai escolher pelo nome.
+        const prodComplexity = customFieldsData.find(
+          f => f.type === "number" && (f.name || "").trim().toLowerCase() === "complexidade"
+        );
+
+        for (const card of mirrors) {
+          const src = sources[card.mirrorSourceId];
+          if (!src) continue;
+          card.idLabels = src.idLabels || [];
+          card.idMembers = src.idMembers || [];
+          card.customFieldItems = (src.customFieldItems || []).map(item => {
+            // Se o produto já tem um campo "Complexidade", reaponta o item da
+            // origem pra ele; senão, mantém o id da origem (definição é mesclada
+            // em customFieldsData abaixo).
+            const srcDef = (src.customFields || []).find(f => f.id === item.idCustomField);
+            const isComplexity = srcDef && srcDef.type === "number"
+              && (srcDef.name || "").trim().toLowerCase() === "complexidade";
+            if (isComplexity && prodComplexity) return { ...item, idCustomField: prodComplexity.id };
+            return item;
+          });
+          mergeById(labelsData, src.labels || []);
+          mergeById(membersData, (src.members || []).map(m => ({
+            id: m.id, fullName: m.fullName, username: m.username,
+          })));
+          if (!prodComplexity) mergeById(customFieldsData, src.customFields || []);
+        }
+      }
 
       setAllLabels(labelsData);
       setMembers(membersData);
@@ -528,6 +629,19 @@ function DashboardApp() {
       if (!cardId) continue;
       (actionsByCard[cardId] = actionsByCard[cardId] || []).push(a);
     }
+
+    // Data de criação do card: action createCard, com fallback no timestamp
+    // embutido no id do card (ver business-context.md → "Definições de métrica").
+    const createdAtOf = (card) => {
+      const acts = actionsByCard[card.id] || [];
+      const created = acts.find(a => a.type === "createCard");
+      if (created) return new Date(created.date);
+      return new Date(parseInt(card.id.substring(0, 8), 16) * 1000);
+    };
+    // Janela de análise: mesma usada no fetch de actions. Serve para o gráfico
+    // de categorias contar só os cards criados dentro do período escolhido
+    // (as métricas de tempo/velocity já são limitadas pelas actions).
+    const windowStart = Date.now() - rangeDays * 86400000;
 
     const completed = [];
     for (const card of cards) {
@@ -596,9 +710,13 @@ function DashboardApp() {
     const velocity = Object.entries(weekMap).sort(([a], [b]) => a.localeCompare(b)).map(([week, count]) => ({ week, count }));
     const avgVelocity = velocity.length ? avg(velocity.map(v => v.count)) : null;
 
+    // Gráfico de categorias: só cards criados DENTRO da janela (rangeDays),
+    // pra ficar consistente com as demais métricas (antes contava todos os
+    // cards abertos do quadro, ignorando o período).
     const catMap = {};
     const catColor = {};
     for (const card of cards) {
+      if (createdAtOf(card).getTime() < windowStart) continue;
       const relevantIds = (card.idLabels || []).filter(id => categoryLabelIds.has(id));
       const labelList = relevantIds.length
         ? relevantIds.map(id => labelById[id]).filter(Boolean)
@@ -650,7 +768,7 @@ function DashboardApp() {
       hasComplexity,
       completed: completed.sort((a, b) => b.doneAt - a.doneAt),
     };
-  }, [cards, actions, progressListIds, doneListIds, categoryLabelIds, allLabels, members, customFields]);
+  }, [cards, actions, progressListIds, doneListIds, categoryLabelIds, allLabels, members, customFields, rangeDays]);
 
   useEffect(() => {
     if (!freshMetrics) return;

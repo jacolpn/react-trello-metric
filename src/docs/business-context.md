@@ -40,8 +40,13 @@ ObjectId do MongoDB, que o Trello usa como ID de card).
 
 Cards sem lista de "concluído" no histórico **não entram** em nenhuma
 métrica de tempo (não têm lead/cycle time, não contam pra velocity) —
-só aparecem na contagem de "cards por categoria", que é um snapshot de todos
-os cards abertos do quadro, independente de status.
+só aparecem na contagem de "cards por categoria". Essa contagem inclui cards
+abertos independente de status, **mas restrita à janela `rangeDays`**: conta só
+os cards criados dentro do período escolhido (data de criação = action
+`createCard` ou fallback do timestamp do `card.id`). Isso mantém o gráfico de
+categorias consistente com as demais métricas (antes contava todos os cards
+abertos do quadro, ignorando o período — causava a impressão de "está pegando
+todos os cards").
 
 ### "Em andamento" x "Concluído" — configurável por quadro
 
@@ -63,7 +68,10 @@ de tempo/velocity/pontuação. Presets disponíveis: 7, 15, 30, 60, 90, 180 e 36
 quinzena) servem para acompanhamento de sprint; as longas, para tendência.
 Atenção: `rangeDays` também limita a busca da action `createCard` — cards
 criados fora da janela caem no fallback do timestamp do `card.id` (ver
-"Definições de métrica").
+"Definições de métrica"). O gráfico de **cards por categoria** também respeita
+`rangeDays` (filtra por data de criação do card), embora o endpoint
+`/boards/{id}/cards` sempre devolva todos os cards abertos — o filtro por
+período é aplicado no cálculo (`useMemo`), não na API.
 
 ### Categoria = etiqueta, mas nem toda etiqueta é categoria
 
@@ -261,8 +269,19 @@ Endpoints usados:
 - `GET /1/boards/{id}/labels` — etiquetas do quadro (`id`, `name`, `color`).
 - `GET /1/boards/{id}/cards` — cards abertos, com `fields` explícito
   incluindo **`idLabels`** e **`idMembers`** (não `labels`/`members`, ver
-  "Débitos técnicos conhecidos"), mais **`customFieldItems=true`** para trazer
-  os valores de custom field embutidos em cada card.
+  "Débitos técnicos conhecidos"), **`cardRole`** e **`mirrorSourceId`** (para
+  detectar e hidratar mirror cards, ver item 5 dos débitos), mais
+  **`customFieldItems=true`** para trazer os valores de custom field embutidos
+  em cada card.
+- `GET /1/cards/{id}` — dados do card de **origem** de cada mirror card
+  (`idLabels`, `idMembers`, `members`, `customFieldItems`, `idBoard`). Chamado
+  por `fetchMirrorSources`, uma vez por `mirrorSourceId` único. **Não** confiar
+  em `labels=true` aqui (volta vazio, item 1) — resolver `idLabels` pelas
+  etiquetas do board de origem (abaixo).
+- `GET /1/boards/{idBoard}/labels` e `GET /1/boards/{idBoard}/customFields` do
+  board de origem — etiquetas e definições de custom field da origem (o endpoint
+  de card único não devolve nenhuma das duas de forma confiável), para resolver
+  os `idLabels`/`idCustomField` do mirror card por id/nome.
 - `GET /1/boards/{id}/actions?filter=createCard,updateCard:idList` — histórico
   de movimentação entre listas, paginado (ver abaixo).
 - `GET /1/boards/{id}/members` — membros do quadro (`fullName`, `username`),
@@ -331,12 +350,43 @@ para não reintroduzir o mesmo problema depois.
    um `if (categoryLabelIds.size === 0)` ingênuo** — já causou bug de
    "todo card aparece Sem categoria" duas vezes.
 
-5. **Cards "espelhados" (mirror cards do Trello) já foram investigados como
-   possível causa de "Sem categoria" e descartados** — na prática o problema
-   real era o item 1 e 4 acima. Se esse sintoma voltar a aparecer, checar
-   primeiro `idLabels` vazio genuíno (card sem etiqueta mesmo, comum em
-   cards criados colando um link na caixa de "Adicionar cartão") antes de
-   assumir que é card espelhado.
+5. **Cards "espelhados" (mirror cards do Trello) NÃO trazem os próprios dados
+   — precisam ser hidratados a partir do card de origem.** O Cloud Backlog
+   (https://trello.com/b/ym7ocFYq/cloud-backlog) centraliza os pedidos e depois
+   *espelha* cards para os boards de produto (FT, Banking, etc.). Um mirror card
+   é só uma referência: na API, seu `idLabels`, `idMembers` e `customFieldItems`
+   vêm **vazios** — os dados reais moram no card de origem. Isso fazia o
+   dashboard mostrar "Sem categoria" / "Sem responsável" / "Sem pontuação" para
+   esses cards (era esse o sintoma que antes atribuíamos só aos itens 1 e 4).
+   - Identificação: o card espelhado tem `cardRole === "mirror"` e
+     `mirrorSourceId` (id do card de origem). Ambos são pedidos no `fields` do
+     fetch de cards.
+   - Correção (em `runAnalysis`): `fetchMirrorSources` busca cada origem por id
+     (`GET /1/cards/{id}` com `members`/`customFieldItems`) e, **por board de
+     origem**, as etiquetas (`/boards/{idBoard}/labels`) e as definições de
+     custom field (`/boards/{idBoard}/customFields`). **Importante:** o param
+     `labels=true` no endpoint de card único volta VAZIO (mesma armadilha do
+     item 1) e o endpoint de card único também não devolve definições de custom
+     field — por isso resolvemos `idLabels`/`idCustomField` contra as coleções
+     do board de origem, não contra o objeto do card. Depois copia
+     `idLabels`/`idMembers`/`customFieldItems` da origem pro espelhado e
+     **mescla** labels/membros/custom fields da origem nos mapas de lookup
+     (`allLabels`, `members`, `customFields`), pra que o pipeline de métricas
+     resolva os nomes sem saber que o card é espelhado.
+   - Complexidade: o custom field "Complexidade" tem id diferente por board.
+     Se o board de produto já tem um campo "Complexidade", os itens da origem
+     são reapontados pro id do produto; senão, a definição da origem é mesclada
+     em `customFields`. Casamento continua por nome (regra do item 2 / seção
+     Pontuação), então funciona nos dois casos.
+   - Cycle/lead time e velocity do espelhado continuam vindo das **actions do
+     board de produto** (o mirror se move nas listas do produto e gera
+     `updateCard:idList` lá) — é o fluxo do time de produto que queremos medir,
+     não o do backlog. Só os dados descritivos (etiqueta/membro/complexidade)
+     vêm da origem.
+   - Degradação graciosa: se uma origem for inacessível (permissão/rede), aquele
+     espelhado só fica sem os dados dela; o resto da análise segue.
+   - Ainda vale checar `idLabels` vazio genuíno (card sem etiqueta mesmo, comum
+     em cards criados colando um link) para cards **não** espelhados.
 
 6. **Cor de paleta no tema MUI precisa ser hex literal, não `var(--...)`**
    — ver seção "Por que MUI + styled-components juntos" acima. Isso já
