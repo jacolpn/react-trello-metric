@@ -51,6 +51,7 @@ import ShowChartIcon from "@mui/icons-material/ShowChart";
 import TrendingUpIcon from "@mui/icons-material/TrendingUp";
 import LocalOfferIcon from "@mui/icons-material/LocalOffer";
 import TableChartIcon from "@mui/icons-material/TableChart";
+import EmojiEventsIcon from "@mui/icons-material/EmojiEvents";
 import ViewKanbanIcon from "@mui/icons-material/ViewKanban";
 import AddIcon from "@mui/icons-material/Add";
 import CloseIcon from "@mui/icons-material/Close";
@@ -96,6 +97,7 @@ const NAV_ITEMS = [
   { key: "velocity", label: "Velocity", icon: TrendingUpIcon },
   { key: "categorias", label: "Categorias", icon: LocalOfferIcon },
   { key: "detalhe", label: "Detalhe por card", icon: TableChartIcon },
+  { key: "pontuacao", label: "Pontuação", icon: EmojiEventsIcon },
 ];
 
 function trelloUrl(path, key, token, extra = {}) {
@@ -273,6 +275,8 @@ function DashboardApp() {
   const [error, setError] = useState("");
   const [cards, setCards] = useState(null);
   const [actions, setActions] = useState(null);
+  const [members, setMembers] = useState([]);
+  const [customFields, setCustomFields] = useState([]);
 
   const [metricsCache, setMetricsCache] = useState({});
 
@@ -446,18 +450,28 @@ function DashboardApp() {
     try {
       const boardId = extractBoardId(boardInput);
       setLoadingMsg("Buscando cards e etiquetas do quadro...");
-      const [cardsRes, labelsRes] = await Promise.all([
+      const [cardsRes, labelsRes, membersRes, customFieldsRes] = await Promise.all([
         fetch(trelloUrl(`/boards/${boardId}/cards`, apiKey, token, {
-          fields: "id,name,idList,idBoard,closed,dateLastActivity,idLabels,shortLink,url",
+          fields: "id,name,idList,idBoard,closed,dateLastActivity,idLabels,idMembers,shortLink,url",
+          customFieldItems: "true",
         })),
         fetch(trelloUrl(`/boards/${boardId}/labels`, apiKey, token, { fields: "name,color", limit: "1000" })),
+        fetch(trelloUrl(`/boards/${boardId}/members`, apiKey, token, { fields: "fullName,username" })),
+        fetch(trelloUrl(`/boards/${boardId}/customFields`, apiKey, token)),
       ]);
       if (!cardsRes.ok) throw new Error(`Erro ao buscar cards (${cardsRes.status})`);
       if (!labelsRes.ok) throw new Error(`Erro ao buscar etiquetas (${labelsRes.status})`);
       const cardsData = await cardsRes.json();
       const labelsData = await labelsRes.json();
+      // membros e custom fields são opcionais: se o Power-Up de Custom Fields
+      // não estiver habilitado ou a chamada falhar, a pontuação por dev
+      // simplesmente não aparece — o resto do dashboard continua funcionando.
+      const membersData = membersRes.ok ? await membersRes.json() : [];
+      const customFieldsData = customFieldsRes.ok ? await customFieldsRes.json() : [];
 
       setAllLabels(labelsData);
+      setMembers(membersData);
+      setCustomFields(customFieldsData);
       const { categoryIds, seenIds } = reconcileCategoryIds(labelsData, categoryLabelIds, knownLabelIds);
       setCategoryLabelIds(categoryIds);
       setKnownLabelIds(seenIds);
@@ -489,6 +503,24 @@ function DashboardApp() {
 
     const labelById = {};
     for (const l of allLabels) labelById[l.id] = l;
+
+    const memberById = {};
+    for (const m of members) memberById[m.id] = m.fullName || m.username || m.id;
+
+    // Campo de pontuação = custom field numérico chamado "Complexidade"
+    // (equivalente ao Story Points do Jira). Casamos pelo nome, sem
+    // diferenciar maiúsculas/acentos, e só aceitamos type "number".
+    const complexityField = customFields.find(
+      f => f.type === "number" && (f.name || "").trim().toLowerCase() === "complexidade"
+    );
+    const cardPoints = (card) => {
+      if (!complexityField) return null;
+      const item = (card.customFieldItems || []).find(i => i.idCustomField === complexityField.id);
+      const raw = item?.value?.number;
+      if (raw == null || raw === "") return null;
+      const n = Number(raw);
+      return Number.isFinite(n) ? n : null;
+    };
 
     const actionsByCard = {};
     for (const a of actions) {
@@ -524,6 +556,8 @@ function DashboardApp() {
           url: card.url || (card.shortLink ? `https://trello.com/c/${card.shortLink}` : `https://trello.com/c/${card.id}`),
           category: labelById[relevantIds[0]]?.name || "Sem categoria",
           createdAt, doneAt: cycleEnd, leadDays, cycleDays,
+          points: cardPoints(card),
+          memberIds: card.idMembers || [],
         });
       }
     }
@@ -579,6 +613,28 @@ function DashboardApp() {
       .sort(([, a], [, b]) => b - a)
       .map(([name, count]) => ({ name, count, color: catColor[name] }));
 
+    // Pontuação por dev (estilo velocity individual do Jira): para cada card
+    // concluído, cada membro do card recebe os pontos CHEIOS de Complexidade
+    // (card com 2 devs conta os pontos inteiros pra cada um). Cards sem membro
+    // caem em "Sem responsável"; cards sem Complexidade preenchida somam 0 pts
+    // mas ainda contam como card concluído — a coluna de cards sem pontuação
+    // dá visibilidade do gap de estimativa.
+    const hasComplexity = !!complexityField;
+    const devMap = {};
+    for (const c of completed) {
+      const ids = c.memberIds.length ? c.memberIds : ["__none__"];
+      for (const id of ids) {
+        const name = id === "__none__" ? "Sem responsável" : (memberById[id] || "Desconhecido");
+        const d = devMap[name] || (devMap[name] = { name, cards: 0, points: 0, unscored: 0 });
+        d.cards += 1;
+        if (c.points != null) d.points += c.points;
+        else d.unscored += 1;
+      }
+    }
+    const pointsByDev = Object.values(devMap)
+      .map(d => ({ ...d, avgPoints: d.cards ? d.points / d.cards : 0 }))
+      .sort((a, b) => b.points - a.points || b.cards - a.cards);
+
     return {
       completedCount: completed.length,
       avgLead: avg(leadValues),
@@ -590,9 +646,11 @@ function DashboardApp() {
       velocity,
       categories,
       cycleScatter,
+      pointsByDev,
+      hasComplexity,
       completed: completed.sort((a, b) => b.doneAt - a.doneAt),
     };
-  }, [cards, actions, progressListIds, doneListIds, categoryLabelIds, allLabels]);
+  }, [cards, actions, progressListIds, doneListIds, categoryLabelIds, allLabels, members, customFields]);
 
   useEffect(() => {
     if (!freshMetrics) return;
@@ -865,6 +923,8 @@ function DashboardApp() {
                     label="Período de análise"
                     value={rangeDays} onChange={e => setRangeDays(Number(e.target.value))}
                   >
+                    <MenuItem value={7}>Últimos 7 dias</MenuItem>
+                    <MenuItem value={15}>Últimos 15 dias</MenuItem>
                     <MenuItem value={30}>Últimos 30 dias</MenuItem>
                     <MenuItem value={60}>Últimos 60 dias</MenuItem>
                     <MenuItem value={90}>Últimos 90 dias</MenuItem>
@@ -1105,6 +1165,46 @@ function DashboardApp() {
                         </TableBody>
                       </Table>
                     </TableContainer>
+                  </>
+                )}
+
+                {activeReport === "pontuacao" && (
+                  <>
+                    <ReportHeader
+                      mode={mode}
+                      title="Pontuação por dev"
+                      description={
+                        metrics.hasComplexity
+                          ? "Soma da Complexidade (custom field, equivalente ao Story Points do Jira) dos cards concluídos, por responsável. Cards com mais de um dev contam os pontos cheios para cada um, então o total por dev pode ultrapassar o total do quadro."
+                          : "Nenhum custom field numérico chamado \"Complexidade\" foi encontrado neste quadro. Habilite o Power-Up de Custom Fields no Trello e crie o campo para ver a pontuação por dev."
+                      }
+                    />
+                    {metrics.hasComplexity && (
+                      <TableContainer sx={{ maxHeight: 448 }}>
+                        <Table size="small" stickyHeader>
+                          <TableHead>
+                            <TableRow>
+                              <TableCell>Dev</TableCell>
+                              <TableCell align="right">Cards concluídos</TableCell>
+                              <TableCell align="right">Pontos</TableCell>
+                              <TableCell align="right">Média pts/card</TableCell>
+                              <TableCell align="right">Sem pontuação</TableCell>
+                            </TableRow>
+                          </TableHead>
+                          <TableBody>
+                            {metrics.pointsByDev.map(d => (
+                              <TableRow key={d.name} hover>
+                                <TableCell>{d.name}</TableCell>
+                                <TableCell align="right" sx={{ fontFamily: "monospace" }}>{d.cards}</TableCell>
+                                <TableCell align="right" sx={{ fontFamily: "monospace" }}>{fmt(d.points)}</TableCell>
+                                <TableCell align="right" sx={{ fontFamily: "monospace" }}>{fmt(d.avgPoints)}</TableCell>
+                                <TableCell align="right" sx={{ fontFamily: "monospace", color: d.unscored ? "warning.main" : "text.secondary" }}>{d.unscored || "—"}</TableCell>
+                              </TableRow>
+                            ))}
+                          </TableBody>
+                        </Table>
+                      </TableContainer>
+                    )}
                   </>
                 )}
               </Paper>

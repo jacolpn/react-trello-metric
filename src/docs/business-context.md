@@ -30,6 +30,7 @@ fornece.
 | **Cycle time (mediana)** | Cycle time do card "típico" do período — valor central resistente a outliers | Mediana dos `cycleDays` de todos os cards concluídos |
 | **Velocity** | Quantidade de cards concluídos por semana (semana ISO) | Contagem de cards com `doneAt` na mesma semana ISO |
 | **Categoria** | A etiqueta do card, restrita às etiquetas marcadas como "categoria" na config | Primeira etiqueta do card que esteja no conjunto `categoryLabelIds` |
+| **Pontuação por dev** | Soma da **Complexidade** (custom field ≈ Story Points do Jira) dos cards concluídos, agrupada por responsável (membro do card) | Para cada card concluído, cada membro recebe os pontos **cheios** de Complexidade |
 
 Data de criação do card: vem da action `createCard` do histórico do Trello.
 Se essa action não estiver dentro da janela de tempo buscada (`rangeDays`),
@@ -53,6 +54,16 @@ manualmente (na tela de Configuração):
 - **Listas de "concluído"**: fim do lead time e do cycle time (ex.: "Done").
 
 Essa seleção é por quadro (ver seção de storage abaixo), não é global.
+
+### Período de análise (`rangeDays`)
+
+A janela de tempo buscada é configurável por quadro (`rangeDays`, em dias) e
+define o `since` do fetch de actions — logo, o que entra em todas as métricas
+de tempo/velocity/pontuação. Presets disponíveis: 7, 15, 30, 60, 90, 180 e 365 dias. Cadências curtas (semana/
+quinzena) servem para acompanhamento de sprint; as longas, para tendência.
+Atenção: `rangeDays` também limita a busca da action `createCard` — cards
+criados fora da janela caem no fallback do timestamp do `card.id` (ver
+"Definições de métrica").
 
 ### Categoria = etiqueta, mas nem toda etiqueta é categoria
 
@@ -118,6 +129,46 @@ maioria das pessoas espera de "faixa normal".
 outliers do próprio cálculo (ex.: cortar acima do percentil 85 antes de
 tirar média/velocity), isso é uma mudança de escopo separada e ainda **não**
 foi feita.
+
+### Pontuação por dev (velocity individual estilo Jira, via Custom Field)
+
+Os quadros usam o **Custom Field "Complexidade"** (Power-Up de Custom Fields
+do Trello, tipo `number`, ex.: `0.5`) como equivalente ao **Story Points do
+Jira**. A aba **"Pontuação"** mostra a *velocity individual*: quanto de
+Complexidade cada dev entregou no período (soma dos pontos dos cards
+concluídos que ele é membro).
+
+**Filosofia Jira (importante):** pontuação afeta *throughput* (quanto foi
+entregue), **não** afeta *tempo*. Por isso o cycle/lead time e o control
+chart **não usam** Complexidade — continuam sendo tempo por card. Pontuação
+entra só na aba nova. É a mesma separação que o Jira faz (Story Points no
+Velocity Report, nunca no Control Chart).
+
+Decisões de negócio já tomadas (não reabrir sem alinhar):
+
+- **Card com 2+ devs → pontos CHEIOS para cada um** (não divide). Card de 3
+  pts com 2 responsáveis conta 3 pts pra cada. Consequência esperada: a soma
+  de pontos por dev **pode ultrapassar** o total do quadro — isso é
+  intencional, reflete que ambos trabalharam no card inteiro. É o
+  comportamento mais comum em times que usam Trello (onde "membro do card"
+  costuma significar "trabalhou nisso", não "dono único").
+- **Card concluído sem Complexidade preenchida** → conta como card entregue
+  mas soma **0 pontos**, e é contabilizado na coluna **"Sem pontuação"**
+  (destacada em `warning`). Não some do relatório — dá visibilidade do *gap
+  de estimativa* (devs/cards que não estão pontuando) em vez de esconder.
+- **Card sem nenhum membro** → cai no bucket **"Sem responsável"**.
+- O campo é casado **pelo nome** ("complexidade", case/acento-insensitive) e
+  só aceita `type === "number"`. Se o quadro não tiver esse campo (ou o
+  Power-Up estiver desligado), a aba mostra uma mensagem explicando como
+  habilitar, em vez de tabela vazia (`hasComplexity`).
+
+Cálculo em `App.jsx` (dentro do `useMemo` de métricas): resolve o campo via
+`complexityField` + helper `cardPoints(card)`, agrega em `pointsByDev`
+(`{ name, cards, points, unscored, avgPoints }`, ordenado por pontos). Ambos
+`pointsByDev` e `hasComplexity` são serializáveis (sem `Date`), então entram
+no cache de métricas automaticamente via `serializeMetrics` (spread) — cache
+antigo (calculado antes dessa feature) degrada pra "campo não encontrado" até
+o próximo recálculo, sem quebrar.
 
 ### Quadros mapeados
 
@@ -209,9 +260,17 @@ Endpoints usados:
 - `GET /1/boards/{id}/lists` — nomes das listas do quadro.
 - `GET /1/boards/{id}/labels` — etiquetas do quadro (`id`, `name`, `color`).
 - `GET /1/boards/{id}/cards` — cards abertos, com `fields` explícito
-  incluindo **`idLabels`** (não `labels`, ver "Débitos técnicos conhecidos").
+  incluindo **`idLabels`** e **`idMembers`** (não `labels`/`members`, ver
+  "Débitos técnicos conhecidos"), mais **`customFieldItems=true`** para trazer
+  os valores de custom field embutidos em cada card.
 - `GET /1/boards/{id}/actions?filter=createCard,updateCard:idList` — histórico
   de movimentação entre listas, paginado (ver abaixo).
+- `GET /1/boards/{id}/members` — membros do quadro (`fullName`, `username`),
+  para resolver `idMembers` → nome do dev na aba "Pontuação".
+- `GET /1/boards/{id}/customFields` — definições dos custom fields do quadro
+  (`id`, `name`, `type`, opções). Usado para achar o campo "Complexidade".
+  **Opcional:** se falhar (Power-Up desligado, sem permissão), a aba
+  "Pontuação" degrada graciosamente — o resto do dashboard não é afetado.
 
 **Paginação de actions:** a API do Trello devolve no máximo 1000 actions por
 chamada, ordenadas da mais recente pra mais antiga. `fetchAllActions` pagina
@@ -249,7 +308,20 @@ para não reintroduzir o mesmo problema depois.
    confiável) e resolver o nome/cor via a lista de `/boards/{id}/labels`
    (`labelById`), nunca confiar em labels embutidas na resposta de cards.
 
-2. **`categoryLabelIds` salvo no localStorage pode ficar "órfão"** se o
+2. **Custom Fields dependem do Power-Up e vêm "vazios" quando ausentes** —
+   o Trello só expõe `customFieldItems` se o Power-Up de Custom Fields estiver
+   habilitado no quadro, e um card **só aparece** no array se tiver aquele
+   campo *preenchido* (campo vazio simplesmente não vem). Por isso o
+   `cardPoints` trata ausência como `null` (não `0`) e a aba "Pontuação"
+   checa `hasComplexity` antes de renderizar a tabela. Não assumir que todo
+   card concluído tem valor de Complexidade.
+
+3. **Preferir `idMembers` (array de IDs) ao campo `members` embutido** — mesma
+   lógica do `idLabels` (item 1): pede-se `idMembers` no `fields` de cards e
+   resolve-se o nome via `/boards/{id}/members` (`memberById`), em vez de
+   confiar no objeto `members` completo na resposta de cards.
+
+4. **`categoryLabelIds` salvo no localStorage pode ficar "órfão"** se o
    usuário trocar de quadro (IDs de etiqueta são únicos por quadro no
    Trello) ou se etiquetas forem criadas/apagadas depois da configuração
    inicial. É por isso que existe `reconcileCategoryIds` — sempre que as
@@ -259,25 +331,25 @@ para não reintroduzir o mesmo problema depois.
    um `if (categoryLabelIds.size === 0)` ingênuo** — já causou bug de
    "todo card aparece Sem categoria" duas vezes.
 
-3. **Cards "espelhados" (mirror cards do Trello) já foram investigados como
+5. **Cards "espelhados" (mirror cards do Trello) já foram investigados como
    possível causa de "Sem categoria" e descartados** — na prática o problema
-   real era o item 1 e 2 acima. Se esse sintoma voltar a aparecer, checar
+   real era o item 1 e 4 acima. Se esse sintoma voltar a aparecer, checar
    primeiro `idLabels` vazio genuíno (card sem etiqueta mesmo, comum em
    cards criados colando um link na caixa de "Adicionar cartão") antes de
    assumir que é card espelhado.
 
-4. **Cor de paleta no tema MUI precisa ser hex literal, não `var(--...)`**
+6. **Cor de paleta no tema MUI precisa ser hex literal, não `var(--...)`**
    — ver seção "Por que MUI + styled-components juntos" acima. Isso já
    quebrou o app inteiro (`Uncaught Error: MUI: Unsupported color`) uma vez.
 
-5. **Textos que dependem do tema (claro/escuro) devem receber a cor
+7. **Textos que dependem do tema (claro/escuro) devem receber a cor
    explicitamente a partir do objeto `palettes` (`src/theme.js`), não
    confiar cegamente em `color="text.secondary"` do MUI** — houve um caso
    em que a cor não acompanhava a troca de tema corretamente num componente
    (`ReportHeader`); a correção foi resolver a cor manualmente via
    `palettes[mode]` em vez de depender só da resolução interna do tema.
 
-6. **Duas fontes de paleta de cor que precisam ficar sincronizadas
+8. **Duas fontes de paleta de cor que precisam ficar sincronizadas
    manualmente**: `src/styles/GlobalStyles.jsx` (CSS variables, a paleta
    "oficial" da empresa) e `src/theme.js` (hex literal, usado pelo MUI e
    pelos gráficos). Se a paleta oficial mudar, atualizar os dois arquivos.
@@ -301,5 +373,5 @@ para não reintroduzir o mesmo problema depois.
   6~~ — **feito**: aba "+ Outro" (ver "Quadros mapeados"). Quadros custom
   ficam só no `localStorage` do navegador, não são compartilhados entre
   usuários.
-- Gerar `theme.js` automaticamente a partir de `GlobalStyles.jsx` (ver item 6
+- Gerar `theme.js` automaticamente a partir de `GlobalStyles.jsx` (ver item 8
   dos débitos técnicos).
